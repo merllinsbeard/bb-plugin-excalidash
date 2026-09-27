@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-excalidash",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bb": ">=0.43",
@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "ExcaliDash",
-    "description": "Boards from your ExcaliDash server inside bb: a sidebar page, a tab beside any thread, and @-mentions that give the agent a board's contents.",
+    "description": "Boards from your ExcaliDash server inside bb: a sidebar page, a tab beside any thread, @-mentions that give the agent a board's contents, and reply cards that open a board beside the thread.",
     "branding": {
       "icon": "./assets/icon.svg"
     },

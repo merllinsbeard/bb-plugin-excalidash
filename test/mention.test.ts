@@ -77,6 +77,7 @@ test("resolves a board into its frames, texts and editing commands", async () =>
     "- Блок A",
     "- связь",
     `excalidash get ${boardId}`,
+    `::excalidash{board="${boardId}"`,
   ]) {
     assert.ok(context.includes(expected), `context mentions ${expected}\n---\n${context}`);
   }

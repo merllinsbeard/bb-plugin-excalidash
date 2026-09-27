@@ -5,12 +5,16 @@
 // REST API and, when a message is sent, turns the picked board into an
 // agent-only summary (frames, their texts, counts) plus the commands of the
 // global `excalidash` skill, which is how agents read and edit boards.
-// The panels that show ExcaliDash itself live in app.tsx.
+// The panels that show ExcaliDash itself and the `::excalidash{…}` reply card
+// live in app.tsx.
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { DEFAULT_URL, excalidashBase } from "./shared.ts";
 
-export const DEFAULT_URL = "https://merlin-hermes.tail78400e.ts.net:9450";
-const REQUEST_TIMEOUT_MS = 8_000;
+// The host gives `search` 2 s per keystroke; `resolve` runs once at send time.
+const SEARCH_TIMEOUT_MS = 1_500;
+const RESOLVE_TIMEOUT_MS = 8_000;
+const LIST_TTL_MS = 30_000;
 const MAX_CONTEXT_CHARS = 12_000;
 const MAX_TEXTS_PER_FRAME = 20;
 
@@ -46,15 +50,10 @@ const boardSchema = boardSummarySchema.extend({
 type Board = z.infer<typeof boardSchema>;
 type Element = z.infer<typeof elementSchema>;
 
-export function normalizeBaseUrl(raw: string | undefined): string {
-  const trimmed = (raw ?? "").trim().replace(/\/+$/, "");
-  return trimmed === "" ? DEFAULT_URL : trimmed;
-}
-
-async function getJson<T>(url: string, schema: z.ZodType<T>): Promise<T> {
+async function getJson<T>(url: string, schema: z.ZodType<T>, timeoutMs: number): Promise<T> {
   const response = await fetch(url, {
     headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) {
     throw new Error(`ExcaliDash ответил HTTP ${response.status} на ${url}`);
@@ -66,6 +65,16 @@ const oneLine = (text: string, max: number) => {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 };
+
+function editingHint(boardId: string): string {
+  return (
+    `Читай и правь доску через скилл excalidash: \`excalidash get ${boardId} --out board.excalidraw\`, ` +
+    `правка через scene.py, затем \`excalidash update ${boardId} board.excalidraw\` (открытые редакторы увидят правку сразу). ` +
+    `Посмотреть доску или фрейм картинкой: \`excalidash shot ${boardId} --out /tmp/board.png [--frame "…"]\`. ` +
+    `Когда покажешь доску в ответе, добавь отдельной строкой \`::excalidash{board="${boardId}" title="<название>"}\`: ` +
+    `у пользователя появится карточка с кнопкой «Открыть рядом».`
+  );
+}
 
 /** Agent-facing description of a board: what is on it and how to work with it. */
 export function describeBoard(board: Board, base: string, collection: string): string {
@@ -106,67 +115,108 @@ export function describeBoard(board: Board, base: string, collection: string): s
     .filter((element) => (element.type === "embeddable" || element.type === "iframe") && element.link)
     .map((element) => element.link);
   if (embeds.length > 0) lines.push("", `Встроено: ${embeds.join(", ")}`);
-  lines.push(
-    "",
-    `Читай и правь доску через скилл excalidash: \`excalidash get ${board.id} --out board.excalidraw\`, ` +
-      `правка через scene.py, затем \`excalidash update ${board.id} board.excalidraw\` (открытые редакторы увидят правку сразу). ` +
-      `Посмотреть доску или фрейм картинкой: \`excalidash shot ${board.id} --out /tmp/board.png [--frame "…"]\`.`,
-  );
+  lines.push("", editingHint(board.id));
   const context = lines.join("\n");
   return context.length > MAX_CONTEXT_CHARS
     ? `${context.slice(0, MAX_CONTEXT_CHARS)}\n…(сводка обрезана; полную даст \`excalidash summary ${board.id}\`)`
     : context;
 }
 
+type BoardListing = { base: string; boards: { id: string; name: string; collection: string }[] };
+
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     url: {
       type: "string",
       label: "ExcaliDash URL",
-      description: "Адрес сервера ExcaliDash, где хранятся доски. Панели и @-упоминания берут доски отсюда.",
+      description: "Адрес сервера ExcaliDash (http или https), где хранятся доски. Панели и @-упоминания берут доски отсюда.",
       default: DEFAULT_URL,
+      experimental_schema: z
+        .string()
+        .refine((value) => excalidashBase(value) !== null, "Нужен адрес вида https://host:port"),
     },
   });
-  const baseUrl = async () => normalizeBaseUrl((await settings.get()).url);
+  async function baseUrl(): Promise<string> {
+    const base = excalidashBase((await settings.get()).url);
+    if (base === null) throw new Error("В настройках плагина ExcaliDash указан адрес не http(s)");
+    return base;
+  }
 
-  async function collectionNames(base: string): Promise<Map<string, string>> {
-    const collections = await getJson(`${base}/api/collections`, z.array(collectionSchema));
+  async function collectionNames(base: string, timeoutMs: number): Promise<Map<string, string>> {
+    const collections = await getJson(`${base}/api/collections`, z.array(collectionSchema), timeoutMs);
     return new Map(collections.map((collection) => [collection.id, collection.name]));
+  }
+
+  // One listing serves every keystroke for LIST_TTL_MS; a failed fetch is dropped
+  // at once so the next keystroke retries.
+  let listing: { at: number; value: Promise<BoardListing> } | null = null;
+  async function loadListing(base: string): Promise<BoardListing> {
+    // ExcaliDash's own ?search= is case-sensitive for Cyrillic, so filter here;
+    // the list carries metadata only and stays small.
+    const params = new URLSearchParams({ limit: "200", sortField: "updatedAt", sortDirection: "desc" });
+    const [list, names] = await Promise.all([
+      getJson(
+        `${base}/api/drawings?${params}`,
+        z.object({ drawings: z.array(boardSummarySchema) }),
+        SEARCH_TIMEOUT_MS,
+      ),
+      collectionNames(base, SEARCH_TIMEOUT_MS),
+    ]);
+    const boards = list.drawings
+      .filter((board) => board.collectionId !== "trash")
+      .map((board) => ({
+        id: board.id,
+        name: board.name,
+        collection: names.get(board.collectionId ?? "") ?? "",
+      }));
+    return { base, boards };
+  }
+  async function boardListing(): Promise<BoardListing> {
+    const base = await baseUrl();
+    const cached = listing && Date.now() - listing.at < LIST_TTL_MS ? await listing.value.catch(() => null) : null;
+    if (cached?.base === base) return cached;
+    const value = loadListing(base);
+    listing = { at: Date.now(), value };
+    value.catch(() => {
+      if (listing?.value === value) listing = null;
+    });
+    return value;
   }
 
   bb.ui.registerMentionProvider({
     id: "board",
     label: "ExcaliDash",
     async search({ query }) {
-      const base = await baseUrl();
-      // ExcaliDash's own ?search= is case-sensitive for Cyrillic, so filter here;
-      // the list carries metadata only and stays small.
-      const params = new URLSearchParams({ limit: "200", sortField: "updatedAt", sortDirection: "desc" });
-      const [list, names] = await Promise.all([
-        getJson(`${base}/api/drawings?${params}`, z.object({ drawings: z.array(boardSummarySchema) })),
-        collectionNames(base),
-      ]);
+      const { boards } = await boardListing();
       const wanted = query.trim().toLocaleLowerCase("ru");
-      return list.drawings
-        .filter((board) => board.collectionId !== "trash")
-        .filter((board) => {
-          const collection = names.get(board.collectionId ?? "") ?? "";
-          return wanted === "" || `${board.name} ${collection}`.toLocaleLowerCase("ru").includes(wanted);
-        })
+      return boards
+        .filter((board) => wanted === "" || `${board.name} ${board.collection}`.toLocaleLowerCase("ru").includes(wanted))
         .slice(0, 20)
-        .map((board) => ({
-          id: board.id,
-          title: board.name,
-          subtitle: names.get(board.collectionId ?? "") ?? "Без коллекции",
-        }));
+        .map((board) => ({ id: board.id, title: board.name, subtitle: board.collection || "Без коллекции" }));
     },
+    // Throwing here would block the user's message, so a failure still sends the
+    // board id and link and leaves reading the board to the agent.
     async resolve(boardId) {
-      const base = await baseUrl();
-      const [board, names] = await Promise.all([
-        getJson(`${base}/api/drawings/${encodeURIComponent(boardId)}`, boardSchema),
-        collectionNames(base),
-      ]);
-      return { context: describeBoard(board, base, names.get(board.collectionId ?? "") ?? "без коллекции") };
+      let base = DEFAULT_URL;
+      try {
+        base = await baseUrl();
+        const [board, names] = await Promise.all([
+          getJson(`${base}/api/drawings/${encodeURIComponent(boardId)}`, boardSchema, RESOLVE_TIMEOUT_MS),
+          collectionNames(base, RESOLVE_TIMEOUT_MS),
+        ]);
+        return { context: describeBoard(board, base, names.get(board.collectionId ?? "") ?? "без коллекции") };
+      } catch (error) {
+        bb.log.warn(`resolve ${boardId}: ${error instanceof Error ? error.message : String(error)}`);
+        return {
+          context: [
+            `Пользователь прикрепил доску ExcaliDash (id ${boardId}), но снимок получить не удалось: ` +
+              `${error instanceof Error ? error.message : String(error)}.`,
+            `Редактор: ${base}/editor/${boardId}`,
+            "",
+            editingHint(boardId),
+          ].join("\n"),
+        };
+      }
     },
   });
 }
