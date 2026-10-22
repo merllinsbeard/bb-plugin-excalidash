@@ -6,7 +6,7 @@ Boards from our ExcaliDash server (https://merlin-hermes.tail78400e.ts.net:9450)
 - **ExcaliDash** in a thread's right panel (New tab → Actions): the same app beside the conversation.
 - **`@` in the composer**: pick a board; at send time the agent gets its id, link, frames with their texts and the `excalidash` skill commands to edit it.
 
-Setting: `url` (ExcaliDash address), `bb plugin config excalidash set url <url>`.
+Setting: `url` (ExcaliDash address), `bb plugin config excalidash set url <url>`. Setting `apiKey` (an ExcaliDash API key with read access, `exd_…`) is needed when ExcaliDash has sign-in on: `bb plugin config excalidash set apiKey <key>`.
 
 ## How it works
 
