@@ -50,17 +50,6 @@ const boardSchema = boardSummarySchema.extend({
 type Board = z.infer<typeof boardSchema>;
 type Element = z.infer<typeof elementSchema>;
 
-async function getJson<T>(url: string, schema: z.ZodType<T>, timeoutMs: number): Promise<T> {
-  const response = await fetch(url, {
-    headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!response.ok) {
-    throw new Error(`ExcaliDash ответил HTTP ${response.status} на ${url}`);
-  }
-  return schema.parse(await response.json());
-}
-
 const oneLine = (text: string, max: number) => {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
@@ -135,11 +124,30 @@ export default async function plugin(bb: BbPluginApi) {
         .string()
         .refine((value) => excalidashBase(value) !== null, "Нужен адрес вида https://host:port"),
     },
+    apiKey: {
+      type: "string",
+      label: "ExcaliDash API-ключ",
+      description: "Ключ ExcaliDash (exd_…) с правом чтения досок и коллекций. Нужен, когда на сервере ExcaliDash включён вход.",
+      secret: true,
+    },
   });
   async function baseUrl(): Promise<string> {
     const base = excalidashBase((await settings.get()).url);
     if (base === null) throw new Error("В настройках плагина ExcaliDash указан адрес не http(s)");
     return base;
+  }
+
+  async function getJson<T>(url: string, schema: z.ZodType<T>, timeoutMs: number): Promise<T> {
+    const apiKey = (await settings.get()).apiKey?.trim();
+    const response = await fetch(url, {
+      headers: { accept: "application/json", ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      const hint = response.status === 401 || response.status === 403 ? ": задайте или проверьте настройку плагина apiKey" : "";
+      throw new Error(`ExcaliDash ответил HTTP ${response.status} на ${url}${hint}`);
+    }
+    return schema.parse(await response.json());
   }
 
   async function collectionNames(base: string, timeoutMs: number): Promise<Map<string, string>> {

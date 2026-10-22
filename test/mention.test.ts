@@ -47,6 +47,7 @@ after(() => {
 async function loadProvider() {
   const { bb, harness } = createFakePluginHost({ pluginId: "excalidash" });
   await plugin(bb);
+  await harness.setSettings({ apiKey: process.env.EXCALIDASH_BB_PLUGIN_API_KEY ?? "" });
   const provider = harness.inspection.registrations.mentionProviders.find((p) => p.id === "board");
   assert.ok(provider, "mention provider registered");
   return provider;
